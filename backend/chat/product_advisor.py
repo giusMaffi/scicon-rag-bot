@@ -1,179 +1,215 @@
 """
 backend.chat.product_advisor
 
-Layer "conversazionale" sopra il motore di ricerca prodotti.
+Costruisce la risposta "intelligente" per l'endpoint /chat/products:
 
-- Usa search_products() per trovare i prodotti rilevanti.
-- Usa OpenAI per generare una risposta in linguaggio naturale
-  che spiega quali modelli consiglia e perché.
-- Restituisce un payload strutturato secondo il BOT CONTRACT ufficiale.
+- chiama search_products(...) per ottenere una lista di Product
+- sintetizza i prodotti in un contesto per l'LLM
+- chiede all'LLM un consiglio in italiano
+- normalizza i prodotti in dict serializzabili per FastAPI/JSON
 """
 
 import os
-from typing import List, Dict, Any, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from backend.rag.product_search import search_products
-
-# ---------- CARICAMENTO .ENV ----------
-
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ENV_PATH = os.path.join(ROOT_DIR, ".env")
-load_dotenv(dotenv_path=ENV_PATH)
-
-OPENAI_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+from backend.rag.product_search import Product, search_products
 
 
-def _compute_confidence_score(products: List[Dict[str, Any]]) -> float:
-    """
-    Calcola un confidence_score semplice a partire dagli score RAG dei prodotti.
-    Per ora usiamo la media degli score disponibili.
-    """
-    scores: List[float] = []
+# ---------------------------------------------------------------------------
+# Caricamento .env dal root del progetto (stessa logica di product_search)
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+ENV_PATH = BASE_DIR / ".env"
+
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+    print(f"[product_advisor] Uso .env da: {ENV_PATH}")
+else:
+    print(f"[product_advisor] ATTENZIONE: .env non trovato in {ENV_PATH}")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+if not OPENAI_API_KEY:
+    print("[product_advisor] ⚠️ OPENAI_API_KEY non impostata: userò un messaggio generico senza LLM.")
+
+
+# ---------------------------------------------------------------------------
+# Funzioni di supporto
+# ---------------------------------------------------------------------------
+
+def _product_to_dict(p: Product) -> Dict[str, Any]:
+    """Converte un oggetto Product in un dict serializzabile in JSON."""
+    return {
+        "id": p.id,
+        "name": p.name,
+        "url": p.url,
+        "description": p.description,
+        "image_url": p.image_url,
+        "sku": p.sku,
+        "brand": p.brand,
+        "price": p.price,
+        "currency": p.currency,
+        "collection": p.collection,
+        "features_text": p.features_text,
+        "tech_specs_text": p.tech_specs_text,
+        "score": p.score,
+        "reason": p.reason,
+    }
+
+
+def _build_products_context(products: List[Product]) -> str:
+    """Costruisce un testo riassuntivo dei prodotti per l'LLM."""
+    lines: List[str] = []
     for p in products:
-        s = p.get("score")
-        if isinstance(s, (int, float)):
-            scores.append(float(s))
+        lines.append(
+            f"- Nome: {p.name}\n"
+            f"  URL: {p.url}\n"
+            f"  Prezzo: {p.price} {p.currency or ''}\n"
+            f"  Collezione: {p.collection or 'n/d'}\n"
+            f"  Brand: {p.brand or 'n/d'}\n"
+            f"  Descrizione: {p.description[:300]}...\n"
+        )
+    return "\n".join(lines)
 
-    if not scores:
-        return 0.0
 
-    return float(sum(scores) / len(scores))
+def _build_fallback_message(user_query: str) -> Dict[str, Any]:
+    """Risposta di fallback quando non troviamo prodotti o non possiamo usare l'LLM."""
+    bot_message = (
+        "Al momento non riesco a trovare un prodotto adatto alla tua richiesta. "
+        "Prova a riformulare la domanda indicando:\n"
+        "- il tipo di utilizzo (strada, gravel, sterrato, uso misto)\n"
+        "- le condizioni di luce (piena, variabile, diffusa, notturna)\n"
+        "- eventuali preferenze su lente (fotocromatica, specchiata, più chiara o più scura)."
+    )
+
+    return {
+        "bot_message": bot_message,
+        "products": [],
+        "follow_up_suggestions": [
+            "Vuoi specificare se usi la bici soprattutto su strada, gravel o sterrato?",
+            "Vuoi indicare se preferisci una lente fotocromatica, più chiara o più scura?",
+        ],
+        "meta": {
+            "intent": "product_recommendation",
+            "user_query": user_query,
+            "sources": ["products_rag"],
+            "confidence_score": 0.0,
+            "applied_filters": {
+                "collection": None,
+                "price_range": None,
+                "lens_type": None,
+            },
+        },
+    }
 
 
-def _build_follow_up_suggestions(user_query: str, products: List[Dict[str, Any]]) -> List[str]:
-    """
-    Costruisce alcuni suggerimenti di follow-up generici ma utili.
-    In futuro possiamo renderli dinamici in base alla query o ai prodotti.
-    """
-    suggestions: List[str] = [
-        "Vuoi che ti suggerisca anche modelli più adatti al pieno sole?",
-        "Preferisci dare priorità al comfort o alla massima protezione della lente?",
-        "Ti interessa confrontare questi modelli anche in base al prezzo?"
-    ]
-    return suggestions
-
+# ---------------------------------------------------------------------------
+# Funzione principale chiamata dall'orchestrator
+# ---------------------------------------------------------------------------
 
 def build_product_advice(
     user_query: str,
-    top_k: int = 5,
+    top_k: int = 6,
     collection_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    - Esegue una ricerca prodotti.
-    - Genera una risposta testuale in italiano che spiega la scelta.
-    - Restituisce un dizionario conforme al BOT CONTRACT:
-
-      {
-        "bot_message": str,
-        "products": [...],
-        "follow_up_suggestions": [...],
-        "meta": {
-            "intent": "product_recommendation",
-            "user_query": str,
-            "sources": ["products_rag"],
-            "confidence_score": float,
-            "applied_filters": {
-                "collection": str|None,
-                "price_range": str|None,
-                "lens_type": str|None
-            }
-        }
-      }
+    Dato un testo libero dell'utente, trova i prodotti più rilevanti e costruisce
+    un messaggio di consiglio + payload strutturato.
     """
-    products = search_products(
+
+    # 1) Ricerca prodotti su Qdrant
+    products: List[Product] = search_products(
         query=user_query,
         top_k=top_k,
         collection_filter=collection_filter,
     )
 
-    # Se non troviamo niente, messaggio di fallback
     if not products:
-        return {
-            "bot_message": (
-                "Al momento non riesco a trovare un prodotto adatto alla tua richiesta. "
-                "Prova a riformulare la domanda indicando l'uso principale (strada, sterrato, "
-                "uso misto) e le condizioni di luce (piena, variabile, diffusa, notturna)."
-            ),
-            "products": [],
-            "follow_up_suggestions": [
-                "Vuoi provare a specificare se usi la bici soprattutto su strada o sterrato?",
-                "Vuoi indicare se cerchi una lente più chiara, fotocromatica o più scura?"
-            ],
-            "meta": {
-                "intent": "product_recommendation",
-                "user_query": user_query,
-                "sources": ["products_rag"],
-                "confidence_score": 0.0,
-                "applied_filters": {
-                    "collection": collection_filter,
-                    "price_range": None,
-                    "lens_type": None,
-                },
-            },
-        }
+        # Nessun prodotto trovato → risposta di fallback
+        return _build_fallback_message(user_query)
 
-    client = OpenAI()
+    # 2) Contesto per l'LLM
+    products_context = _build_products_context(products)
 
-    # Costruiamo un contesto compatto da dare al modello
-    product_summaries: List[str] = []
-    for p in products:
-        line = (
-            f"- Nome: {p.get('name')}\n"
-            f"  SKU: {p.get('sku')}\n"
-            f"  Prezzo: {p.get('price')} {p.get('currency')}\n"
-            f"  Collezione: {p.get('collection')}\n"
-            f"  URL: {p.get('url')}\n"
-            f"  Motivazione RAG: {p.get('reason')}\n"
+    # 3) Costruzione messaggio bot (con o senza LLM)
+    if openai_client is None:
+        # Nessuna chiave OpenAI: messaggio "statico" costruito sul primo prodotto
+        best = products[0]
+        bot_message = (
+            f"In base alla tua richiesta, ti suggerisco {best.name}.\n\n"
+            f"È un modello di {best.brand or 'Scicon Sports'} pensato per un utilizzo versatile. "
+            f"Puoi vedere i dettagli qui: {best.url}."
         )
-        product_summaries.append(line)
+        follow_up_suggestions = [
+            "Vuoi che ti suggerisca anche modelli più adatti al pieno sole?",
+            "Vuoi filtrare tra modelli più economici o più premium?",
+        ]
+    else:
+        # Usiamo l'LLM per generare un consiglio naturale
+        system_msg = (
+            "Sei un product advisor di Scicon Sports. "
+            "Consigli occhiali da ciclismo in modo chiaro, onesto e concreto, "
+            "senza linguaggio promozionale esagerato. Rispondi in italiano."
+        )
 
-    products_block = "\n".join(product_summaries)
+        user_msg = (
+            f"Utente: {user_query}\n\n"
+            f"Di seguito hai una lista di prodotti candidati già selezionati (non citarli tutti, "
+            f"ma concentrati su quelli più adatti):\n\n"
+            f"{products_context}\n\n"
+            "Compito:\n"
+            "- Suggerisci 1–3 modelli adatti alla richiesta.\n"
+            "- Spiega in modo semplice perché li consigli (condizioni di luce, tipo uso, comfort).\n"
+            "- Usa un tono pratico, come un commesso competente in un negozio di ciclismo.\n"
+        )
 
-    system_prompt = (
-        "Sei un product specialist di Scicon Sports. Rispondi in italiano, con tono chiaro, "
-        "amichevole e competente, ma senza essere prolisso.\n\n"
-        "Linee guida di risposta:\n"
-        "- Rispondi in massimo 2-3 paragrafi brevi.\n"
-        "- Presenta sempre 2-3 modelli principali in elenco puntato, non tutta la lista.\n"
-        "- Spiega perché sono adatti alla richiesta dell'utente (tipo di lente, condizioni di luce, "
-        "tipo di utilizzo: strada, sterrato, uso misto, competizione, training, ecc.).\n"
-        "- Non usare la parola 'gravel' a meno che sia stata usata esplicitamente dall'utente.\n"
-        "- Se i modelli sono molto simili tra loro (es. stesso modello in colori diversi), "
-        "raggruppali e cita le varianti solo come dettaglio.\n"
-        "- Chiudi sempre con UNA sola frase di suggerimento pratico o call-to-action "
-        "(es. quale modello sceglieresti tu o cosa potrebbe fare l'utente come prossimo passo).\n"
-        "- Non inventare informazioni che non emergono dai dati prodotti; usa solo ciò che ti viene fornito."
-    )
+        try:
+            resp = openai_client.responses.create(
+                model="gpt-4.1-mini",
+                input=[
+                    {
+                        "role": "system",
+                        "content": system_msg,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_msg,
+                    },
+                ],
+            )
+            bot_message = resp.output[0].content[0].text
+        except Exception as e:
+            print(f"[product_advisor] ⚠️ Errore nella chiamata LLM: {e}")
+            # Fallback sul primo prodotto
+            best = products[0]
+            bot_message = (
+                f"In base alla tua richiesta, ti suggerisco {best.name}.\n\n"
+                f"È un modello di {best.brand or 'Scicon Sports'} pensato per un utilizzo versatile. "
+                f"Puoi vedere i dettagli qui: {best.url}."
+            )
 
-    user_prompt = (
-        f"L'utente ti ha chiesto:\n"
-        f"\"{user_query}\"\n\n"
-        f"Ecco la lista di prodotti rilevanti da cui scegliere (già filtrata dal motore RAG):\n"
-        f"{products_block}\n\n"
-        f"Adesso rispondi all'utente seguendo le linee guida."
-    )
+        follow_up_suggestions = [
+            "Vuoi che ti suggerisca anche modelli più adatti al pieno sole?",
+            "Preferisci dare priorità al comfort o alla massima protezione della lente?",
+            "Ti interessa confrontare questi modelli anche in base al prezzo?",
+        ]
 
-    chat_resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.4,
-    )
+    # 4) Confidence score (semplice: punteggio del primo prodotto)
+    confidence_score = float(products[0].score) if products and products[0].score is not None else 0.0
 
-    bot_message = chat_resp.choices[0].message.content.strip()
-
-    confidence_score = _compute_confidence_score(products)
-    follow_ups = _build_follow_up_suggestions(user_query, products)
+    # 5) Normalizzazione prodotti in dict
+    products_payload = [_product_to_dict(p) for p in products]
 
     return {
         "bot_message": bot_message,
-        "products": products,
-        "follow_up_suggestions": follow_ups,
+        "products": products_payload,
+        "follow_up_suggestions": follow_up_suggestions,
         "meta": {
             "intent": "product_recommendation",
             "user_query": user_query,
