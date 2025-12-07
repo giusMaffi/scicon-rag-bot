@@ -18,3 +18,7 @@ venv/
 
 # Env files
 .env
+
+backend/logs/
+*.jsonl
+*_backup.py
