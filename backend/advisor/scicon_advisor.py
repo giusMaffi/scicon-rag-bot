@@ -354,7 +354,8 @@ def get_first_question(intent_primary: str) -> str:
         return "Hai già una prescrizione oculistica recente (indicativamente non più vecchia di 1-2 anni)?"
 
     if intent_primary == "post_vendita_supporto":
-        return "Che tipo di problema hai? (lente / montatura-aste / viti / nasello / clip-in / altro)"
+        if intent_primary == "post_vendita_supporto":
+           return "Quale componente presenta il problema?\n(lente / montatura-aste / viti / nasello / clip-in / altro)"
 
     return "Le tue uscite sono principalmente su strada, gravel o MTB?"
 
@@ -1470,17 +1471,17 @@ def process_answer(session_id: str, answer: str) -> Dict[str, Any]:
         if last_qid == "SUP_Q3":
             return process_support_third_answer(session_id, answer)
 
-        q = "Che tipo di problema hai? (lente / montatura-aste / viti / nasello / clip-in / altro)"
+        q = "Quale componente presenta il problema?\n(lente / montatura-aste / viti / nasello / clip-in / altro)"
         log_event(session_id, "question_asked", {"question_id": "SUP_Q1", "text": q})
-        return {"session_id": session_id, "assistant_message": "Ok, ripartiamo da qui.", "next_question": q}
+        return {"session_id": session_id, "assistant_message": "Ok — ripartiamo da qui in modo pulito.", "next_question": q}
 
     # RX FLOW (placeholder: qui manteniamo compatibilità con eventuali file esterni)
     if flow_type == "rx_flow":
         q = "Hai già una prescrizione oculistica recente (indicativamente non più vecchia di 1-2 anni)?"
         log_event(session_id, "question_asked", {"question_id": "Q1_RX", "text": q})
-        return {"session_id": session_id, "assistant_message": "Ok, ripartiamo da qui.", "next_question": q}
+        return {"session_id": session_id, "assistant_message": "Ok — ripartiamo da qui in modo pulito.", "next_question": q}
 
     # SPORT FLOW (default)
     q = "Le tue uscite sono principalmente su strada, gravel o MTB?"
     log_event(session_id, "question_asked", {"question_id": "Q1", "text": q})
-    return {"session_id": session_id, "assistant_message": "Ok, ripartiamo da qui.", "next_question": q}
+    return {"session_id": session_id, "assistant_message": "Ok — ripartiamo da qui in modo pulito.", "next_question": q}
