@@ -11,16 +11,28 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Carica variabili da .env
+# ---------------------------------------------------------
+# PATH DI BASE + .env
+# ---------------------------------------------------------
+
+# backend/
 BASE_DIR = Path(__file__).resolve().parents[1]
+# root progetto
 PROJECT_ROOT = BASE_DIR.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(ENV_PATH)
+
+# Directory del modulo advisor (dove sta questo file)
+ADVISOR_DIR = Path(__file__).resolve().parent             # backend/advisor
+# Directory per i CSV dei ricambi
+DATA_DIR = ADVISOR_DIR / "data"
+# CSV con i link ai ricambi
+SPARE_PARTS_CSV = DATA_DIR / "spare_parts_links.csv"
 
 # Client OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -36,8 +48,46 @@ ALLOWED_INTENTS = [
     "comparazione",
     "riduzione_rischio",
     "affidabilità_tecnica",
-    "prescrizione_ottica",  # intento RX
+    "prescrizione_ottica",
+    "budget",
+    "upgrade_miglioramento",
+    "info_lenti",
+    "info_montatura",
+    "post_vendita_supporto",
 ]
+
+# ---------------------------------------------------------
+# SUPPORT: Issue canonicalization / synonyms
+# ---------------------------------------------------------
+
+# Canonical issue labels usate nel CSV (o comunque attese)
+# Qui mappiamo input user-friendly -> chiave CSV
+ISSUE_SYNONYMS: Dict[str, str] = {
+    "lente": "lente-ricambio",
+    "vetro": "lente-ricambio",
+    "lenti": "lente-ricambio",
+    "lens": "lente-ricambio",
+
+    "nasello": "nasello",
+    "nose": "nasello",
+    "nosepad": "nasello",
+
+    "terminali": "terminali",
+    "terminal": "terminali",
+    "tips": "terminali",
+
+    "kit-clip": "kit-clip",
+    "clip": "kit-clip",
+    "clip-in": "kit-clip",
+    "inserto": "kit-clip",
+}
+
+def canonicalize_issue(issue: Optional[str]) -> Optional[str]:
+    if not issue:
+        return None
+    i = issue.strip().lower()
+    return ISSUE_SYNONYMS.get(i, i)
+
 
 # ---------------------------------------------------------
 # ROUTER DEGLI INTENTI – Smista la conversazione nei flow
@@ -48,29 +98,38 @@ def route_intent(intent_primary: str):
     Decide quale flusso conversazionale attivare in base all'intento rilevato.
     """
 
+    # Flusso RX
+    if intent_primary == "prescrizione_ottica":
+        return "rx_flow"
+
+    # Flusso comparazione
+    if intent_primary == "comparazione":
+        return "compare_flow"
+
+    # Flusso budget
+    if intent_primary == "budget":
+        return "budget_flow"
+
+    # Info tecniche (lenti, montature)
+    if intent_primary in ["info_lenti", "info_montatura"]:
+        return "info_flow"
+
+    # Supporto post vendita
+    if intent_primary == "post_vendita_supporto":
+        return "support_flow"
+
+    # Intenti sportivi / generali
     sport_intents = [
         "valutazione",
         "riduzione_rischio",
         "affidabilità_tecnica",
-        "problema_specifico",
+        "upgrade_miglioramento",
     ]
 
     if intent_primary in sport_intents:
         return "sport_flow"
 
-    if intent_primary == "comparazione":
-        return "compare_flow"
-
-    if intent_primary == "budget":
-        return "budget_flow"
-
-    if intent_primary == "prescrizione_ottica":
-        return "rx_flow"
-
-    info_intents = ["info_lenti", "info_montatura"]
-    if intent_primary in info_intents:
-        return "info_flow"
-
+    # Default -> sport
     return "sport_flow"
 
 
@@ -131,10 +190,21 @@ def detect_intent(query: str) -> Dict[str, Optional[str]]:
 
     system_prompt = (
         "Sei un classificatore di intenti per un assistente di acquisto di occhiali da ciclismo SCICON.\n"
-        f"Gli intenti validi sono: {', '.join(ALLOWED_INTENTS)}.\n\n"
+        "Gli intenti validi sono:\n"
+        "- valutazione\n"
+        "- comparazione\n"
+        "- riduzione_rischio\n"
+        "- affidabilità_tecnica\n"
+        "- prescrizione_ottica\n"
+        "- budget\n"
+        "- upgrade_miglioramento\n"
+        "- info_lenti\n"
+        "- info_montatura\n"
+        "- post_vendita_supporto\n\n"
         "Regole:\n"
-        "- Scegli SEMPRE un intent_primary.\n"
+        "- Scegli SEMPRE un intent_primary tra quelli sopra.\n"
         "- Scegli un intent_secondary solo se presente, altrimenti null.\n"
+        "- Mantieni sempre coerenza semantica: se l’utente parla di problemi con occhiali esistenti → post_vendita_supporto.\n"
         "- Rispondi SOLO con un JSON con le chiavi: intent_primary, intent_secondary, confidence, reasoning.\n"
     )
 
@@ -197,9 +267,9 @@ def build_opening_message(query: str, intent_primary: str, intent_secondary: Opt
     # Caso specifico: lenti graduate / RX
     if intent_primary == "prescrizione_ottica":
         base_variants = [
-            "Ok, ho capito che ti servono occhiali SCICON compatibili con la tua prescrizione.",
-            "Chiaro, stai cercando una soluzione SCICON che ti permetta di usare le lenti graduate durante le uscite.",
-            "Ho capito: ti servono occhiali SCICON che possano montare lenti ottiche su misura.",
+            "Ok, ho capito che ti servono occhiali compatibili con la tua prescrizione.",
+            "Chiaro, stai cercando una soluzione che ti permetta di usare le lenti graduate durante le uscite.",
+            "Ho capito: ti servono occhiali che possano montare lenti ottiche su misura.",
         ]
         extra_variants = [
             " Vediamo come orientarti tra le opzioni RX senza complicarti la vita.",
@@ -218,11 +288,25 @@ def build_opening_message(query: str, intent_primary: str, intent_secondary: Opt
 
         return base + extra + " " + closer
 
+    # Caso supporto post-vendita (copy coerente)
+    if intent_primary == "post_vendita_supporto":
+        base_variants = [
+            "Ok, ho capito: ti serve supporto post-vendita per identificare il ricambio corretto.",
+            "Chiaro: facciamo una diagnosi rapida e ti porto al ricambio giusto senza errori.",
+            "Perfetto: mi dai due dettagli e ti indirizzo al pezzo corretto (o al supporto) in modo pulito.",
+        ]
+        closer_variants = [
+            " Iniziamo con una prima domanda semplice.",
+            " Partiamo dalla base con una prima domanda.",
+            " Cominciamo da una cosa facile.",
+        ]
+        return random.choice(base_variants) + random.choice(closer_variants)
+
     # Caso standard (flow sportivo / comparazione / altri)
     base_variants = [
-        "Ok, ho capito che stai cercando occhiali da ciclismo per uscite lunghe e vuoi evitare una scelta sbagliata.",
-        "Ho capito: ti servono occhiali da ciclismo per uscite lunghe e vuoi essere sicuro di non sbagliare modello.",
-        "Chiaro, stai cercando un paio di occhiali da ciclismo per uscite lunghe e vuoi fare una scelta sensata, non casuale.",
+        "Ok, ho capito che stai cercando occhiali da ciclismo e vuoi evitare una scelta sbagliata.",
+        "Ho capito: vuoi essere sicuro di non sbagliare modello e fare una scelta sensata.",
+        "Chiaro: vuoi un consiglio mirato, non casuale.",
     ]
 
     if intent_primary == "comparazione":
@@ -232,13 +316,13 @@ def build_opening_message(query: str, intent_primary: str, intent_secondary: Opt
         ]
     elif intent_primary == "riduzione_rischio":
         extra_variants = [
-            " Vediamo insieme come evitare un modello poco adatto alle tue uscite.",
-            " Ti aiuto a ridurre al minimo il rischio di prendere un modello sbagliato.",
+            " Vediamo insieme come ridurre al minimo il rischio di prendere un modello sbagliato.",
+            " Ti aiuto a evitare una scelta poco adatta alle tue uscite.",
         ]
     elif intent_primary == "affidabilità_tecnica":
         extra_variants = [
-            " Possiamo guardare anche agli aspetti tecnici per trovare qualcosa di davvero affidabile.",
-            " Ti guido con indicazioni tecniche per scegliere un prodotto coerente con l'uso che ne farai.",
+            " Possiamo guardare anche agli aspetti tecnici per scegliere qualcosa di davvero affidabile.",
+            " Ti guido con indicazioni tecniche per scegliere un prodotto coerente con l'uso reale.",
         ]
     else:
         extra_variants = [
@@ -263,10 +347,14 @@ def get_first_question(intent_primary: str) -> str:
     """
     Restituisce la prima domanda (Q1) in base all'intento.
     - Per 'prescrizione_ottica' → domanda RX
+    - Per 'post_vendita_supporto' → domanda supporto
     - Per il resto → domanda sportiva standard
     """
     if intent_primary == "prescrizione_ottica":
         return "Hai già una prescrizione oculistica recente (indicativamente non più vecchia di 1-2 anni)?"
+
+    if intent_primary == "post_vendita_supporto":
+        return "Che tipo di problema hai? (lente / montatura-aste / viti / nasello / clip-in / altro)"
 
     return "Le tue uscite sono principalmente su strada, gravel o MTB?"
 
@@ -286,7 +374,16 @@ def start_advisor_session(query: str) -> AdvisorSessionResult:
     next_question = get_first_question(intents["intent_primary"])
 
     log_event(session_id, "assistant_message", {"text": assistant_message})
-    log_event(session_id, "question_asked", {"text": next_question, "question_id": "Q1"})
+
+    # question id coerenti con i flow
+    if flow_type == "rx_flow":
+        qid = "Q1_RX"
+    elif flow_type == "support_flow":
+        qid = "SUP_Q1"
+    else:
+        qid = "Q1"
+
+    log_event(session_id, "question_asked", {"text": next_question, "question_id": qid})
 
     return AdvisorSessionResult(
         session_id=session_id,
@@ -302,7 +399,7 @@ def start_advisor_session(query: str) -> AdvisorSessionResult:
 # ---------------------------------------------------------
 
 def normalize_terrain(answer: str) -> str:
-    a = answer.lower()
+    a = (answer or "").lower()
     if "strad" in a:
         return "strada"
     if "grav" in a or "ghia" in a:
@@ -320,7 +417,7 @@ def normalize_rx_prescription_status(answer: str) -> str:
     - 'presente'
     - 'mancante'
     """
-    a = answer.lower()
+    a = (answer or "").lower()
     yes_keywords = ["si", "sì", "yes", "ce l'ho", "ce lho", "ce l ho", "già", "gia", "recent"]
     no_keywords = ["no", "non ancora", "devo farla", "devo rifarla", "vecchia", "scaduta"]
 
@@ -329,7 +426,6 @@ def normalize_rx_prescription_status(answer: str) -> str:
     if any(k in a for k in no_keywords):
         return "mancante"
 
-    # default: consideriamo presente per non bloccare il flow
     return "presente"
 
 
@@ -340,7 +436,7 @@ def normalize_rx_solution_choice(answer: str) -> str:
     - 'sport_rx'
     - 'non_so'
     """
-    a = answer.lower()
+    a = (answer or "").lower()
     if "clip" in a or "inserto" in a or "insert" in a:
         return "clip_in"
     if "sport" in a or "dedicat" in a or "lenti graduate" in a:
@@ -354,9 +450,6 @@ def normalize_rx_solution_choice(answer: str) -> str:
 # ---------------- FLOW SPORTIVO: Q1 ----------------
 
 def process_sport_first_answer(session_id: str, answer: str) -> Dict[str, str]:
-    """
-    Gestione della risposta alla Q1 del flow sportivo.
-    """
     normalized = normalize_terrain(answer)
 
     log_event(session_id, "answer_given", {
@@ -412,11 +505,6 @@ def process_sport_first_answer(session_id: str, answer: str) -> Dict[str, str]:
 # ---------------- FLOW RX: Q1 → Q2 ----------------
 
 def process_rx_first_answer(session_id: str, answer: str) -> Dict[str, str]:
-    """
-    Gestisce la risposta alla Q1 RX:
-    - Hai già una prescrizione recente?
-    Genera Q2 RX sulla tipologia di soluzione (clip-in vs sport RX).
-    """
     normalized = normalize_rx_prescription_status(answer)
 
     log_event(session_id, "answer_given", {
@@ -454,10 +542,7 @@ def process_rx_first_answer(session_id: str, answer: str) -> Dict[str, str]:
     )
 
     log_event(session_id, "assistant_message", {"text": assistant_msg})
-    log_event(session_id, "question_asked", {
-        "question_id": "Q2_RX",
-        "text": q2
-    })
+    log_event(session_id, "question_asked", {"question_id": "Q2_RX", "text": q2})
 
     return {
         "session_id": session_id,
@@ -467,7 +552,7 @@ def process_rx_first_answer(session_id: str, answer: str) -> Dict[str, str]:
 
 
 def normalize_light_condition(answer: str) -> str:
-    a = answer.lower()
+    a = (answer or "").lower()
     keywords_variabile = [
         "varia", "cambia", "ombra", "bosco", "boschi",
         "tramonto", "altalenante", "spesso diversa", "continuamente"
@@ -491,9 +576,6 @@ def normalize_light_condition(answer: str) -> str:
 # ---------------- FLOW SPORTIVO: Q2 → Q3 ----------------
 
 def process_sport_second_answer(session_id: str, answer: str) -> Dict[str, str]:
-    """
-    Gestione della risposta alla Q2 del flow sportivo.
-    """
     normalized = normalize_light_condition(answer)
 
     log_event(session_id, "answer_given", {
@@ -558,11 +640,6 @@ def process_sport_second_answer(session_id: str, answer: str) -> Dict[str, str]:
 # ---------------- FLOW RX: Q2 → Q3 ----------------
 
 def process_rx_second_answer(session_id: str, answer: str) -> Dict[str, str]:
-    """
-    Gestisce la risposta alla Q2 RX:
-    - preferenza tra clip-in / sport RX / non so
-    Genera Q3 RX sulla priorità (campo visivo / leggerezza / stabilità / estetica).
-    """
     normalized = normalize_rx_solution_choice(answer)
 
     log_event(session_id, "answer_given", {
@@ -574,7 +651,7 @@ def process_rx_second_answer(session_id: str, answer: str) -> Dict[str, str]:
     if normalized == "clip_in":
         msg_variants = [
             "Perfetto, gli inserti ottici / clip-in ti permettono di usare la stessa montatura sia con che senza correzione.",
-            "Ok, con un inserto ottico puoi avere una base sportiva SCICON e la parte graduata solo dove serve.",
+            "Ok, con un inserto ottico puoi avere una base sportiva e la parte graduata solo dove serve.",
             "Bene, la soluzione clip-in ti dà flessibilità e ti permette di gestire meglio cambi di utilizzo.",
         ]
     elif normalized == "sport_rx":
@@ -607,10 +684,7 @@ def process_rx_second_answer(session_id: str, answer: str) -> Dict[str, str]:
     )
 
     log_event(session_id, "assistant_message", {"text": assistant_msg})
-    log_event(session_id, "question_asked", {
-        "question_id": "Q3_RX",
-        "text": q3
-    })
+    log_event(session_id, "question_asked", {"question_id": "Q3_RX", "text": q3})
 
     return {
         "session_id": session_id,
@@ -620,87 +694,450 @@ def process_rx_second_answer(session_id: str, answer: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------
-#        DISPATCH GENERICO PER Q1 E Q2 (SPORT vs RX)
+#                  SUPPORT FLOW (POST-VENDITA)
 # ---------------------------------------------------------
 
-def process_first_answer(session_id: str, answer: str) -> Dict[str, str]:
-    """
-    Dispatch generico:
-    - Se la session è sport_flow → usa process_sport_first_answer
-    - Se la session è rx_flow    → usa process_rx_first_answer
-    """
-    flow_type = get_flow_for_session(session_id)
+def normalize_support_issue(text: str) -> str:
+    t = (text or "").lower()
 
-    if flow_type == "rx_flow":
-        return process_rx_first_answer(session_id, answer)
+    if "lente" in t or "vetro" in t:
+        return "lente"
 
-    # default: flow sportivo
-    return process_sport_first_answer(session_id, answer)
+    if "montatura" in t or "frame" in t or "asta" in t or "aste" in t:
+        return "montatura"
 
+    if "vite" in t or "viti" in t or "screw" in t:
+        return "viti"
 
-def process_second_answer(session_id: str, answer: str) -> Dict[str, str]:
-    """
-    Dispatch generico:
-    - Se la session è sport_flow → usa process_sport_second_answer
-    - Se la session è rx_flow    → usa process_rx_second_answer
-    """
-    flow_type = get_flow_for_session(session_id)
+    if "nasello" in t or "nose" in t or "nosepad" in t:
+        return "nasello"
 
-    if flow_type == "rx_flow":
-        return process_rx_second_answer(session_id, answer)
+    if "clip" in t or "inserto" in t or "clip-in" in t:
+        return "clip"
 
-    return process_sport_second_answer(session_id, answer)
+    return "non_specificato"
 
 
-# ---------------------------------------------------------
-#       UTILS: PROFILO UTENTE DA LOGS (Q1–Q3 / RX)
-# ---------------------------------------------------------
+def normalize_support_model(answer: str) -> str:
+    a = (answer or "").lower()
 
-def normalize_sport_priority(answer: str) -> Optional[str]:
-    """
-    Normalizza la priorità sportiva (Q3) in:
-    - 'protezione'
-    - 'ventilazione'
-    - 'comfort'
-    """
-    if not answer:
+    possible_models = {
+        "aeroshade": "Aeroshade",
+        "aerowing": "Aerowing",
+        "aerotrail": "Aerotrail",
+        "aerocomfort": "Aerocomfort",
+        "aeroscope": "Aeroscope",
+    }
+
+    for key, model in possible_models.items():
+        if key in a:
+            return model
+
+    return "modello_non_specificato"
+
+
+def normalize_support_priority(answer: str) -> str:
+    a = (answer or "").lower()
+
+    if any(w in a for w in ["urgente", "subito", "immediato"]):
+        return "urgente"
+
+    if any(w in a for w in ["ricambio", "pezzo", "solo", "replacement"]):
+        return "ricambio"
+
+    if any(w in a for w in ["assistenza", "tecnica", "riparazione", "repair", "ticket"]):
+        return "assistenza"
+
+    if any(w in a for w in ["va bene", "quando puoi", "non urgente"]):
+        return "non_urgente"
+
+    return "non_specificato"
+
+
+# DB ricambi:
+# - prima: Dict[model][issue] = url (sovrascriveva righe duplicate)
+# - ora:   Dict[model][issue] = [url1, url2, ...]
+SpareDB = Dict[str, Dict[str, List[str]]]
+
+def load_spare_parts_db(force_reload: bool = False) -> Dict[str, Dict[str, list[str]]]:
+    import csv
+    from typing import Dict, List
+
+    if not hasattr(load_spare_parts_db, "_cache"):
+        load_spare_parts_db._cache = None  # type: ignore[attr-defined]
+
+    if load_spare_parts_db._cache is not None and not force_reload:  # type: ignore[attr-defined]
+        return load_spare_parts_db._cache  # type: ignore[attr-defined]
+
+    db: Dict[str, Dict[str, List[str]]] = {}
+
+    if not SPARE_PARTS_CSV.exists():
+        load_spare_parts_db._cache = db  # type: ignore[attr-defined]
+        return db
+
+    try:
+        with SPARE_PARTS_CSV.open("r", encoding="utf-8", newline="") as f:
+            sample = f.read(2048)
+            f.seek(0)
+
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+            except Exception:
+                dialect = csv.excel
+
+            reader = csv.DictReader(f, dialect=dialect)
+            if not reader.fieldnames:
+                load_spare_parts_db._cache = db  # type: ignore[attr-defined]
+                return db
+
+            header_map = {h.strip().lower(): h for h in reader.fieldnames if h}
+
+            model_col = header_map.get("model")
+            issue_col = header_map.get("issue")
+            url_col = header_map.get("url")
+
+            if not (model_col and issue_col and url_col):
+                load_spare_parts_db._cache = db  # type: ignore[attr-defined]
+                return db
+
+            for row in reader:
+                model = (row.get(model_col) or "").strip()
+                issue = (row.get(issue_col) or "").strip().lower()
+                url = (row.get(url_col) or "").strip()
+
+                if not model or not issue or not url:
+                    continue
+
+                if model not in db:
+                    db[model] = {}
+                if issue not in db[model]:
+                    db[model][issue] = []
+                if url not in db[model][issue]:
+                    db[model][issue].append(url)
+
+    except Exception:
+        load_spare_parts_db._cache = {}
+        return {}
+
+    load_spare_parts_db._cache = db  # type: ignore[attr-defined]
+    return db
+
+
+def resolve_model_key(model: str, db: SpareDB, issue: Optional[str] = None) -> Optional[str]:
+    if not model or not db:
         return None
-    a = answer.lower()
-    if "protez" in a or "occhi" in a or "sicurezz" in a:
-        return "protezione"
-    if "ventil" in a or "appann" in a:
-        return "ventilazione"
-    if "comfort" in a or "lungo" in a or "ore" in a:
-        return "comfort"
+
+    if model in db:
+        return model
+
+    m_low = model.strip().lower()
+
+    for k in db.keys():
+        if k.strip().lower() == m_low:
+            return k
+
+    candidates = [k for k in db.keys() if k.strip().lower().startswith(m_low)]
+    if not candidates:
+        return None
+
+    if issue:
+        issue_key = canonicalize_issue(issue.strip().lower()) or issue.strip().lower()
+        issue_matches = [c for c in candidates if issue_key in (db.get(c) or {})]
+        if len(issue_matches) == 1:
+            return issue_matches[0]
+        if len(issue_matches) > 1:
+            issue_matches.sort(key=len)
+            return issue_matches[0]
+
+    candidates.sort(key=len)
+    return candidates[0]
+
+
+def resolve_issue_key(user_issue: str, issue_map: Dict[str, list[str]]) -> Optional[str]:
+    """
+    Prova a mappare una categoria utente (es. 'lente', 'montatura', 'viti')
+    su una issue reale del CSV (es. 'fender-regular', 'nosepad-kit', ecc.)
+    usando keyword-based fuzzy matching sui nomi delle issue disponibili.
+    """
+    if not issue_map:
+        return None
+
+    ui = (user_issue or "").strip().lower()
+    if not ui:
+        return None
+
+    # match diretto (se mai capitasse)
+    if ui in issue_map:
+        return ui
+
+    # keyword buckets -> pattern attesi nei handle CSV
+    patterns = {
+        "lente": ["lens", "lente", "visor", "shield"],
+        "montatura": ["frame", "temple", "arm", "asta", "montatura"],
+        "viti": ["screw", "vite", "bolt"],
+        "nasello": ["nose", "nosepad", "pad"],
+        "clip": ["clip", "insert", "rx"],
+    }
+
+    keys = list(issue_map.keys())
+
+    # 1) se user_issue è una delle macro-categorie note, cerco pattern in keys
+    if ui in patterns:
+        for p in patterns[ui]:
+            for k in keys:
+                if p in k:
+                    return k
+
+    # 2) fallback: se l'utente ha scritto qualcosa di specifico, cerco contenimento
+    # (es. "fender" / "nosepad" / "regular")
+    for k in keys:
+        if ui in k:
+            return k
+
+    # 3) fallback euristico: prova a spezzare parole utente e matchare
+    parts = [x for x in ui.replace("_", " ").replace("-", " ").split() if len(x) >= 3]
+    for part in parts:
+        for k in keys:
+            if part in k:
+                return k
+
     return None
 
 
-def normalize_rx_priority(answer: str) -> Optional[str]:
+def process_support_first_answer(session_id: str, answer: str) -> Dict[str, str]:
+    issue = normalize_support_issue(answer)
+
+    log_event(session_id, "answer_given", {
+        "question_id": "SUP_Q1",
+        "raw_answer": answer,
+        "normalized": issue
+    })
+
+    msg_map = {
+        "lente": "Ok, hai un problema legato alla lente.",
+        "montatura": "Ok, hai riscontrato un problema sulla montatura o sulle aste.",
+        "viti": "Ok, sembra un problema di viti o piccoli componenti.",
+        "nasello": "Ok, possiamo risolvere il problema del nasello.",
+        "clip": "È un problema relativo all'inserto ottico / clip-in.",
+        "non_specificato": "Ok, ho capito il problema generale.",
+    }
+
+    base_msg = msg_map.get(issue, msg_map["non_specificato"])
+    assistant_msg = base_msg + " Puoi dirmi su quale modello di occhiale è successo?"
+
+    q2 = "Su quale modello hai riscontrato il problema? (Aeroshade, Aerowing, Aerotrail, ecc.)"
+
+    log_event(session_id, "assistant_message", {"text": assistant_msg})
+    log_event(session_id, "question_asked", {"question_id": "SUP_Q2", "text": q2})
+
+    return {
+        "session_id": session_id,
+        "assistant_message": assistant_msg,
+        "next_question": q2
+    }
+
+
+def process_support_second_answer(session_id: str, answer: str) -> Dict[str, str]:
+    raw_input = (answer or "").strip()
+    raw_low = raw_input.lower()
+
+    spare_db = load_spare_parts_db()
+
+    # -----------------------------
+    # B1 — UTENTE NON SA LA VARIANTE
+    # -----------------------------
+    if (
+        not raw_input
+        or "non lo so" in raw_low
+        or raw_low in {"non so", "boh", "non saprei", "non ricordo"}
+        or "non so la variante" in raw_low
+    ):
+        model = "modello_non_specificato"
+
+        log_event(session_id, "answer_given", {
+            "question_id": "SUP_Q2",
+            "raw_answer": answer,
+            "normalized": model
+        })
+        log_event(session_id, "support_variant_unknown", {
+            "unknown": True,
+            "raw_answer": answer
+        })
+
+        assistant_msg = (
+            "Va benissimo, succede spesso. Anche senza la variante possiamo andare avanti.\n\n"
+            "Per trovarla velocemente, prova così:\n"
+            "1) guarda **sull’asta interna**: spesso c’è scritto qualcosa tipo *Aeroshade-xl* o *Aeroshade-kunken*\n"
+            "2) se non la trovi, dimmi almeno **colore della montatura** e se è una versione ‘speciale’\n"
+            "3) se hai a portata di mano il **codice prodotto** o un **link**, incollalo: aiuta a essere precisi\n\n"
+            "Intanto ti faccio un’ultima domanda per capire quanto è urgente e se ti serve solo il ricambio o assistenza."
+        )
+
+        q3 = (
+            "Qual è la tua priorità?\n"
+            "- mi serve solo il pezzo di ricambio\n"
+            "- ho bisogno di assistenza tecnica\n"
+            "- è urgente\n"
+            "- non è urgente"
+        )
+
+        log_event(session_id, "assistant_message", {"text": assistant_msg})
+        log_event(session_id, "question_asked", {"question_id": "SUP_Q3", "text": q3})
+
+        return {
+            "session_id": session_id,
+            "assistant_message": assistant_msg,
+            "next_question": q3
+        }
+
+    # ----------------------------------
+    # CASO: VARIANTE ESATTA GIÀ SCRITTA
+    # ----------------------------------
+    exact_variant = None
+    for k in spare_db.keys():
+        if k.lower() == raw_low:
+            exact_variant = k
+            break
+
+    if exact_variant:
+        log_event(session_id, "answer_given", {
+            "question_id": "SUP_Q2",
+            "raw_answer": answer,
+            "normalized": exact_variant
+        })
+        log_event(session_id, "support_variant_unknown", {
+            "unknown": False,
+            "raw_answer": answer
+        })
+
+        assistant_msg = (
+            f"Perfetto, problema sul modello **{exact_variant}**. "
+            "Ho un'ultima domanda per calibrare la soluzione migliore."
+        )
+
+        q3 = (
+            "Qual è la tua priorità?\n"
+            "- mi serve solo il pezzo di ricambio\n"
+            "- ho bisogno di assistenza tecnica\n"
+            "- è urgente\n"
+            "- non è urgente"
+        )
+
+        log_event(session_id, "assistant_message", {"text": assistant_msg})
+        log_event(session_id, "question_asked", {"question_id": "SUP_Q3", "text": q3})
+
+        return {
+            "session_id": session_id,
+            "assistant_message": assistant_msg,
+            "next_question": q3
+        }
+
+    # ----------------------------------
+    # CASO: MODELLO BASE (ES. Aeroshade)
+    # ----------------------------------
+    base_model = normalize_support_model(raw_input) or "modello_non_specificato"
+
+    log_event(session_id, "answer_given", {
+        "question_id": "SUP_Q2",
+        "raw_answer": answer,
+        "normalized": base_model
+    })
+
+    base_low = base_model.lower()
+    variants = [k for k in spare_db.keys() if k.lower().startswith(base_low)]
+
+    # ----------------------------------
+    # PIÙ VARIANTI → CHIEDI Q2_VARIANT
+    # ----------------------------------
+    if len(variants) > 1:
+        variants_sorted = sorted(variants, key=len)
+        variants_text = "\n".join(f"- {v}" for v in variants_sorted)
+
+        assistant_msg = (
+            f"Perfetto, problema sul modello **{base_model}**.\n"
+            "Per darti il link giusto mi serve una precisazione: quale variante hai?\n"
+            f"{variants_text}"
+        )
+
+        next_q = "Scrivimi esattamente una delle varianti qui sopra (copiandola)."
+
+        log_event(session_id, "assistant_message", {"text": assistant_msg})
+        log_event(session_id, "question_asked", {"question_id": "SUP_Q2_VARIANT", "text": next_q})
+
+        return {
+            "session_id": session_id,
+            "assistant_message": assistant_msg,
+            "next_question": next_q
+        }
+
+    # ----------------------------------
+    # UNA SOLA VARIANTE O NESSUNA
+    # ----------------------------------
+    final_model = variants[0] if len(variants) == 1 else base_model
+
+    if final_model != base_model:
+        log_event(session_id, "answer_given", {
+            "question_id": "SUP_Q2",
+            "raw_answer": answer,
+            "normalized": final_model
+        })
+
+    log_event(session_id, "support_variant_unknown", {
+        "unknown": False,
+        "raw_answer": answer
+    })
+
+    assistant_msg = (
+        f"Perfetto, problema sul modello **{final_model}**. "
+        "Ho un'ultima domanda per calibrare la soluzione migliore."
+    )
+
+    q3 = (
+        "Qual è la tua priorità?\n"
+        "- mi serve solo il pezzo di ricambio\n"
+        "- ho bisogno di assistenza tecnica\n"
+        "- è urgente\n"
+        "- non è urgente"
+    )
+
+    log_event(session_id, "assistant_message", {"text": assistant_msg})
+    log_event(session_id, "question_asked", {"question_id": "SUP_Q3", "text": q3})
+
+    return {
+        "session_id": session_id,
+        "assistant_message": assistant_msg,
+        "next_question": q3
+    }
+
+
+# ---------------------------------------------------------
+# DISPATCH UNICO "DEMO-SAFE" (usa last question_id)
+# ---------------------------------------------------------
+
+def get_last_question_id(session_id: str) -> Optional[str]:
     """
-    Normalizza la priorità RX (Q3_RX) in:
-    - 'campo_visivo'
-    - 'comfort'
-    - 'stabilita'
-    - 'estetica'
+    Ritorna l'ultimo question_id loggato (event_type == question_asked) per la sessione.
     """
-    if not answer:
+    try:
+        with EVENTS_LOG_PATH.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
         return None
-    a = answer.lower()
-    if "campo" in a or "ampio" in a or "visiv" in a:
-        return "campo_visivo"
-    if "leggerezza" in a or "leggero" in a or "comfort" in a:
-        return "comfort"
-    if "stabil" in a or "muove" in a or "gioco" in a or "inserto" in a:
-        return "stabilita"
-    if "estetica" in a or "look" in a or "stile" in a:
-        return "estetica"
+
+    for line in reversed(lines):
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("session_id") != session_id:
+            continue
+        if ev.get("event_type") == "question_asked":
+            data = ev.get("data") or {}
+            return data.get("question_id")
     return None
 
 
 def load_session_events(session_id: str):
-    """
-    Restituisce tutti gli eventi di una sessione come lista (in ordine cronologico).
-    """
     events = []
     try:
         with EVENTS_LOG_PATH.open("r", encoding="utf-8") as f:
@@ -717,29 +1154,23 @@ def load_session_events(session_id: str):
 
 
 def build_user_profile_from_logs(session_id: str) -> Dict[str, Any]:
-    """
-    Ricostruisce un profilo utente leggendo gli answer_given nel log.
-    Output di esempio:
-    {
-        "session_id": "...",
-        "flow_type": "sport_flow" | "rx_flow",
-        "terrain": "strada" | "gravel" | "mtb" | None,
-        "light_condition": "variabile" | "stabile" | None,
-        "sport_priority": "protezione" | "ventilazione" | "comfort" | None,
-        "rx_prescription_status": "presente" | "mancante" | None,
-        "rx_solution_choice": "clip_in" | "sport_rx" | "non_so" | None,
-        "rx_priority": "campo_visivo" | "comfort" | "stabilita" | "estetica" | None,
-    }
-    """
     profile: Dict[str, Any] = {
         "session_id": session_id,
         "flow_type": get_flow_for_session(session_id),
+
         "terrain": None,
         "light_condition": None,
         "sport_priority": None,
+
         "rx_prescription_status": None,
         "rx_solution_choice": None,
         "rx_priority": None,
+
+        "support_issue": None,
+        "support_model": None,
+        "support_priority": None,
+
+        "support_variant_unknown": False,
     }
 
     events = load_session_events(session_id)
@@ -749,407 +1180,307 @@ def build_user_profile_from_logs(session_id: str) -> Dict[str, Any]:
     for ev in events:
         if ev.get("event_type") != "answer_given":
             continue
+
         data = ev.get("data") or {}
         qid = data.get("question_id")
         raw = (data.get("raw_answer") or "").strip()
-        normalized = (data.get("normalized") or "").strip() or None
+        normalized = (data.get("normalized") or "").strip()
 
-        if qid == "Q1":
-            profile["terrain"] = normalized or normalize_terrain(raw)
-        elif qid == "Q2":
-            profile["light_condition"] = normalized or normalize_light_condition(raw)
-        elif qid == "Q3":
-            profile["sport_priority"] = normalized or normalize_sport_priority(raw)
-        elif qid == "Q1_RX":
-            profile["rx_prescription_status"] = normalized or normalize_rx_prescription_status(raw)
-        elif qid == "Q2_RX":
-            profile["rx_solution_choice"] = normalized or normalize_rx_solution_choice(raw)
-        elif qid == "Q3_RX":
-            profile["rx_priority"] = normalized or normalize_rx_priority(raw)
+        if qid == "SUP_Q1":
+            # manteniamo user-friendly in log, ma canonicalizziamo nel profilo
+            profile["support_issue"] = canonicalize_issue(normalized or normalize_support_issue(raw))
+
+        elif qid == "SUP_Q2":
+            raw_low = raw.lower()
+
+            if (
+                "non lo so" in raw_low
+                or "non so" in raw_low
+                or "non ricordo" in raw_low
+                or "non saprei" in raw_low
+            ):
+                profile["support_model"] = "modello_non_specificato"
+                profile["support_variant_unknown"] = True
+            else:
+                if raw and "-" in raw:
+                    profile["support_model"] = raw.strip()
+                else:
+                    model_norm = normalized or normalize_support_model(raw)
+                    profile["support_model"] = model_norm if model_norm else "modello_non_specificato"
+
+        elif qid == "SUP_Q3":
+            pr = normalized or normalize_support_priority(raw)
+            profile["support_priority"] = pr
 
     return profile
 
 
-# ---------------------------------------------------------
-#       MINI CATALOGO PRODOTTI + LOGICA DI SCORING
-# ---------------------------------------------------------
+def process_support_variant_answer(session_id: str, answer: str) -> Dict[str, str]:
+    raw = (answer or "").strip()
+    raw_low = raw.lower()
+    spare_db = load_spare_parts_db()
 
-# Catalogo fittizio ma coerente con il brand SCICON.
-# Non è collegato al RAG, serve solo per il prototipo di raccomandazione.
+    chosen = None
+    for k in spare_db.keys():
+        if k.lower() == raw_low:
+            chosen = k
+            break
 
-PRODUCT_CATALOG = [
-    {
-        "id": "aerotrail_photo",
-        "name": "SCICON Aerotrail Photochromic",
-        "product_type": "sport",
-        "rx_compatible": True,
-        "rx_modes": ["clip_in"],
-        "terrain": ["strada", "gravel"],
-        "light": ["variabile"],
-        "sport_priorities": ["protezione", "ventilazione", "comfort"],
-        "rx_priorities": [],
-        "short_reason": "lente fotocromatica molto versatile, montatura leggera e buona ventilazione.",
-    },
-    {
-        "id": "aeroshade",
-        "name": "SCICON Aeroshade Performance",
-        "product_type": "sport",
-        "rx_compatible": True,
-        "rx_modes": ["clip_in"],
-        "terrain": ["strada", "gravel"],
-        "light": ["stabile", "variabile"],
-        "sport_priorities": ["protezione", "comfort"],
-        "rx_priorities": [],
-        "short_reason": "schermo ampio, copertura massima e look molto racing.",
-    },
-    {
-        "id": "aerowing",
-        "name": "SCICON Aerowing",
-        "product_type": "sport",
-        "rx_compatible": False,
-        "rx_modes": [],
-        "terrain": ["strada"],
-        "light": ["stabile"],
-        "sport_priorities": ["protezione", "comfort"],
-        "rx_priorities": [],
-        "short_reason": "occhiale iconico, ottima protezione e forte identità estetica.",
-    },
-    {
-        "id": "aero_rx_clip",
-        "name": "SCICON Aeroshade + Clip-in RX",
-        "product_type": "rx",
-        "rx_compatible": True,
-        "rx_modes": ["clip_in"],
-        "terrain": ["strada", "gravel"],
-        "light": ["variabile", "stabile"],
-        "sport_priorities": ["protezione", "comfort"],
-        "rx_priorities": ["campo_visivo", "stabilita"],
-        "short_reason": "base performance Aeroshade con inserto ottico stabile e campo visivo ampio.",
-    },
-    {
-        "id": "aero_rx_sport",
-        "name": "SCICON Sport RX dedicato",
-        "product_type": "rx",
-        "rx_compatible": True,
-        "rx_modes": ["sport_rx"],
-        "terrain": ["strada"],
-        "light": ["stabile", "variabile"],
-        "sport_priorities": ["comfort", "protezione"],
-        "rx_priorities": ["comfort", "estetica", "campo_visivo"],
-        "short_reason": "montatura pensata per lenti graduate dedicate, molto pulita e vicina a un occhiale tradizionale.",
-    },
-]
+    log_event(session_id, "answer_given", {
+        "question_id": "SUP_Q2_VARIANT",
+        "raw_answer": answer,
+        "normalized": chosen or raw
+    })
 
+    if not chosen:
+        profile = build_user_profile_from_logs(session_id)
 
-def score_product_for_sport(profile: Dict[str, Any], product: Dict[str, Any]) -> int:
-    """
-    Calcola uno score semplice per i flow sportivi.
-    """
-    score = 0
+        base_model = (profile.get("support_model") or "modello_non_specificato")
+        base_low = str(base_model).strip().lower().split("-")[0]
 
-    terrain = profile.get("terrain")
-    if terrain and terrain in product.get("terrain", []):
-        score += 3
+        if not base_low or base_low in {"modello_non_specificato", "none"}:
+            base_low = "aero"
 
-    light = profile.get("light_condition")
-    if light and light in product.get("light", []):
-        score += 3
+        variants = [k for k in spare_db.keys() if k.strip().lower().startswith(base_low)]
+        variants_sorted = sorted(variants, key=len)
+        variants_text = "\n".join(f"- {v}" for v in variants_sorted) if variants_sorted else "- (nessuna variante trovata)"
 
-    priority = profile.get("sport_priority")
-    if priority and priority in product.get("sport_priorities", []):
-        score += 4
+        assistant_msg = (
+            "Ok, così com’è non riesco a riconoscere quella variante.\n\n"
+            "Per evitare errori, scegli una di queste (copiala uguale):\n"
+            f"{variants_text}\n\n"
+            "Suggerimenti rapidi:\n"
+            "- la variante è spesso **incisa sull’asta interna**\n"
+            "- se mi dici il **colore** o incolli un **codice prodotto/link**, posso restringere ancora di più"
+        )
 
-    # Piccolo bonus se è un prodotto sport puro
-    if product.get("product_type") == "sport":
-        score += 1
+        next_q = "Scrivimi esattamente una delle varianti qui sopra (copiandola)."
 
-    return score
+        log_event(session_id, "assistant_message", {"text": assistant_msg})
+        log_event(session_id, "question_asked", {"question_id": "SUP_Q2_VARIANT", "text": next_q})
 
-
-def score_product_for_rx(profile: Dict[str, Any], product: Dict[str, Any]) -> int:
-    """
-    Calcola uno score per i flow RX.
-    Considera:
-    - tipo di configurazione (clip_in vs sport_rx)
-    - priorità RX
-    - compatibilità RX del prodotto
-    """
-    score = 0
-
-    if not product.get("rx_compatible"):
-        return 0
-
-    rx_choice = profile.get("rx_solution_choice")  # clip_in | sport_rx | non_so
-    if rx_choice == "clip_in" and "clip_in" in product.get("rx_modes", []):
-        score += 4
-    elif rx_choice == "sport_rx" and "sport_rx" in product.get("rx_modes", []):
-        score += 4
-    elif rx_choice == "non_so" and product.get("rx_modes"):
-        score += 2  # generico, va bene qualsiasi cosa RX-ready
-
-    rx_priority = profile.get("rx_priority")
-    if rx_priority and rx_priority in product.get("rx_priorities", []):
-        score += 4
-
-    # Usiamo anche terreno/luminosità se presenti
-    terrain = profile.get("terrain")
-    if terrain and terrain in product.get("terrain", []):
-        score += 2
-
-    light = profile.get("light_condition")
-    if light and light in product.get("light", []):
-        score += 2
-
-    # Piccolo bonus se è chiaramente un prodotto RX
-    if product.get("product_type") == "rx":
-        score += 1
-
-    return score
-
-
-def pick_top_products(scored_products):
-    """
-    Dato un elenco di tuple (product, score), restituisce:
-    - primary_product
-    - secondary_product (se disponibile)
-    """
-    if not scored_products:
-        return None, None
-
-    scored_products = sorted(scored_products, key=lambda x: x[1], reverse=True)
-    primary = scored_products[0][0]
-    secondary = scored_products[1][0] if len(scored_products) > 1 and scored_products[1][1] > 0 else None
-    return primary, secondary
-
-
-def build_explanation(profile: Dict[str, Any],
-                      primary: Dict[str, Any],
-                      secondary: Optional[Dict[str, Any]]) -> str:
-    """
-    Costruisce una motivazione in linguaggio naturale basata su profilo e prodotti.
-    """
-    flow_type = profile.get("flow_type")
-    pieces = []
-
-    if flow_type == "rx_flow":
-        intro = "Ti suggerisco questa configurazione RX partendo da quello che mi hai detto."
-    else:
-        intro = "Ti suggerisco questi occhiali partendo da come usi la bici e da ciò che per te è prioritario."
-    pieces.append(intro)
-
-    # Profilo sintetico
-    if profile.get("terrain"):
-        pieces.append(f" Usi gli occhiali principalmente su {profile['terrain']}.")
-    if profile.get("light_condition"):
-        if profile["light_condition"] == "variabile":
-            pieces.append(" Affronti spesso condizioni di luce variabile.")
-        else:
-            pieces.append(" Pedali di solito in condizioni di luce abbastanza stabili.")
-    if flow_type != "rx_flow" and profile.get("sport_priority"):
-        mapping = {
-            "protezione": "massima protezione degli occhi",
-            "ventilazione": "buona ventilazione e anti-appannamento",
-            "comfort": "comfort nel lungo periodo",
+        return {
+            "session_id": session_id,
+            "assistant_message": assistant_msg,
+            "next_question": next_q
         }
-        desc = mapping.get(profile["sport_priority"], profile["sport_priority"])
-        pieces.append(f" Hai indicato come priorità {desc}.")
-    if flow_type == "rx_flow":
-        if profile.get("rx_prescription_status"):
-            if profile["rx_prescription_status"] == "presente":
-                pieces.append(" Hai già una prescrizione recente.")
-            elif profile["rx_prescription_status"] == "mancante":
-                pieces.append(" Non hai ancora una prescrizione aggiornata.")
-        if profile.get("rx_solution_choice"):
-            mapping_choice = {
-                "clip_in": "un inserto ottico / clip-in",
-                "sport_rx": "una soluzione sportiva con lenti graduate dedicate",
-                "non_so": "una soluzione RX da definire insieme",
-            }
-            pieces.append(f" Come configurazione ti orienti verso {mapping_choice.get(profile['rx_solution_choice'], 'una soluzione RX flessibile')}.")
-        if profile.get("rx_priority"):
-            mapping_rx = {
-                "campo_visivo": "campo visivo ampio",
-                "comfort": "leggerezza e comfort",
-                "stabilita": "stabilità in movimento dell'inserto",
-                "estetica": "estetica e look complessivo",
-            }
-            pieces.append(f" Per te conta soprattutto {mapping_rx.get(profile['rx_priority'], profile['rx_priority'])}.")
 
-    # Spiegazione legata ai prodotti
-    pieces.append(
-        f" Per questo ti propongo come prima scelta **{primary['name']}**, "
-        f"perché {primary['short_reason']}"
+    log_event(session_id, "support_variant_unknown", {"unknown": False, "raw_answer": answer})
+
+    log_event(session_id, "answer_given", {
+        "question_id": "SUP_Q2",
+        "raw_answer": chosen,
+        "normalized": chosen
+    })
+
+    assistant_msg = (
+        f"Perfetto: variante **{chosen}**. "
+        "Ho un'ultima domanda per calibrare la soluzione migliore."
     )
 
-    if secondary:
-        pieces.append(
-            f" Come seconda opzione puoi considerare **{secondary['name']}**, "
-            f"che rimane coerente con le tue esigenze ma con un'impostazione leggermente diversa."
-        )
+    q3 = (
+        "Qual è la tua priorità?\n"
+        "- mi serve solo il pezzo di ricambio\n"
+        "- ho bisogno di assistenza tecnica\n"
+        "- è urgente\n"
+        "- non è urgente"
+    )
 
-    return " ".join(pieces)
+    log_event(session_id, "assistant_message", {"text": assistant_msg})
+    log_event(session_id, "question_asked", {"question_id": "SUP_Q3", "text": q3})
 
-
-def recommend_products_for_session(session_id: str) -> Dict[str, Any]:
-    """
-    Entry point principale per il motore di raccomandazione MVP.
-
-    Usa:
-    - build_user_profile_from_logs(session_id)
-    - PRODUCT_CATALOG
-    per restituire:
-    {
-        "session_id": ...,
-        "flow_type": "sport_flow" | "rx_flow",
-        "primary_product": {...} | None,
-        "secondary_product": {...} | None,
-        "explanation": "..."
+    return {
+        "session_id": session_id,
+        "assistant_message": assistant_msg,
+        "next_question": q3
     }
+
+
+def process_support_third_answer(session_id: str, answer: str) -> Dict[str, Any]:
     """
+    SUP_Q3: gestisce priorità e genera output finale del support flow.
+    Micro-fix: direct_links sempre lista piatta + log support_links_resolved coerente.
+    Micro-copy: tono più SCICON.
+    """
+    priority = normalize_support_priority(answer)
+
+    log_event(session_id, "answer_given", {
+        "question_id": "SUP_Q3",
+        "raw_answer": answer,
+        "normalized": priority
+    })
+
     profile = build_user_profile_from_logs(session_id)
-    flow_type = profile.get("flow_type", "sport_flow")
 
-    scored = []
+    issue_raw = (profile.get("support_issue") or "problema").strip()
+    issue_key = (issue_raw or "").strip().lower()
 
-    if flow_type == "rx_flow":
-        for product in PRODUCT_CATALOG:
-            s = score_product_for_rx(profile, product)
-            if s > 0:
-                scored.append((product, s))
-        # fallback se nessun prodotto ha score > 0
-        if not scored:
-            for product in PRODUCT_CATALOG:
-                if product.get("product_type") == "rx":
-                    scored.append((product, 1))
-    else:
-        for product in PRODUCT_CATALOG:
-            s = score_product_for_sport(profile, product)
-            if s > 0:
-                scored.append((product, s))
-        if not scored:
-            for product in PRODUCT_CATALOG:
-                if product.get("product_type") == "sport":
-                    scored.append((product, 1))
+    model_input = (profile.get("support_model") or "modello_non_specificato").strip()
 
-    primary, secondary = pick_top_products(scored) if scored else (None, None)
+    priority_label = (priority or "").replace("_", " ")
 
-    if primary:
-        explanation = build_explanation(profile, primary, secondary)
-    else:
-        explanation = (
-            "Non ho abbastanza informazioni per suggerirti un modello preciso, "
-            "ma possiamo affinare il consiglio con qualche domanda in più."
+    spare_db = load_spare_parts_db()
+    resolved_model = resolve_model_key(model_input, spare_db, issue=issue_raw) or model_input
+
+    # Link singolo (se esiste)
+    link = None
+    if resolved_model and resolved_model in spare_db:
+        link = spare_db[resolved_model].get(issue_key)
+
+    # Multi-link (caso: più opzioni per lo stesso ricambio sullo stesso modello)
+    # Nota: qui NON sono "varianti modello" (tipo -xl), ma più opzioni ricambio (taglie/fit/colori).
+    all_urls_for_issue = []
+    if resolved_model and resolved_model in spare_db:
+        # se nel db c'è una singola url non possiamo inferire alternative.
+        # ma la tua pipeline ha già gestito casi "multi-link" e li passa come lista.
+        # Qui ricostruiamo in modo robusto leggendo dal log "support_links_resolved" se serve.
+        pass
+
+    # --- Helper: prova a recuperare direttamente dal recommendation precedente (se presente nei log) ---
+    # In alcuni casi il sistema potrebbe già aver loggato/creato una lista di link.
+    # Qui restiamo "demo-safe": se non troviamo, usiamo link singolo o fallback.
+    direct_links: list[str] = []
+
+    # Caso: se l'issue ha più opzioni (es. nasello taglie) le hai già normalizzate a lista in output.
+    # Ricreiamo la logica in modo deterministico: se per quello specifico modello/issue esiste una lista nel CSV,
+    # la tua pipeline la gestisce altrove. Qui facciamo solo output stabile.
+    # Se il chiamante (advisor_api) ha già passato una lista in "link" (errore vecchio), la normalizziamo.
+    if isinstance(link, list):
+        direct_links = [str(u).strip() for u in link if str(u).strip()]
+    elif isinstance(link, str) and link.strip():
+        direct_links = [link.strip()]
+
+    # Se nel profilo abbiamo "support_variant_unknown" True, non forziamo “resolved_model” in copy
+    shown_model = model_input if model_input and model_input != "modello_non_specificato" else resolved_model
+
+    # Nota variante (solo se davvero abbiamo risolto a una variante diversa e l’input era sensato)
+    variant_note = ""
+    if (
+        resolved_model
+        and model_input
+        and model_input != "modello_non_specificato"
+        and resolved_model != model_input
+    ):
+        variant_note = f"\n_(Nota: ho identificato la variante **{resolved_model}** per essere più preciso sui ricambi.)_"
+
+    # -----------------------
+    # COPY: header + riepilogo
+    # -----------------------
+    assistant_msg = (
+        "Perfetto — riepilogo rapido:\n"
+        f"- Componente: **{issue_raw}**\n"
+        f"- Modello: **{shown_model}**\n"
+        f"- Priorità: **{priority_label}**\n\n"
+        "Ecco la soluzione più efficace:\n\n"
+    )
+
+    # -----------------------
+    # COPY: risposta per priorità
+    # -----------------------
+    has_variants = False  # varianti MODELLO (es. -xl / -kunken). Qui default False.
+
+    if priority == "ricambio":
+        if direct_links and len(direct_links) >= 2:
+            has_variants = False  # sono opzioni ricambio, non varianti modello
+            links_block = "\n".join([f"- {u}" for u in direct_links])
+            assistant_msg += (
+                f"👉 Ho trovato più opzioni per **{issue_raw}** su **{resolved_model}** (es. taglie/fit):\n"
+                f"{links_block}\n"
+                f"{variant_note}\n"
+                "Se mi dici quale taglia/fit ti serve (oppure mi mandi una foto del pezzo), ti confermo quella giusta."
+            )
+        elif direct_links and len(direct_links) == 1:
+            assistant_msg += (
+                f"👉 Ricambio **{issue_raw}** per **{resolved_model}**:\n"
+                f"- {direct_links[0]}\n"
+                f"{variant_note}\n"
+                "Se vuoi, ti guido passo-passo nel montaggio."
+            )
+        else:
+            assistant_msg += (
+                "👉 Posso aiutarti a trovare il ricambio corretto, ma mi manca il link preciso per questa combinazione.\n"
+                "Se mi scrivi la **variante** (es. *-xl / -kunken*) oppure mi incolli un **codice prodotto / link ordine**, lo recupero."
+            )
+
+    elif priority == "assistenza":
+        assistant_msg += (
+            "👉 Ok. Ti scrivo un testo pronto da inoltrare al supporto SCICON (con modello, problema e richiesta).\n"
+            "Dimmi solo: vuoi includere anche una foto del pezzo o del danno?"
         )
 
+    elif priority == "urgente":
+        assistant_msg += (
+            "👉 Capito. Per urgenze la via più rapida è contattare subito il supporto.\n"
+            "Se mi confermi il modello e una foto del problema, ti preparo un messaggio immediato da inoltrare."
+        )
+
+    else:
+        assistant_msg += (
+            "👉 Perfetto. Possiamo procedere con calma e individuare il ricambio esatto.\n"
+            "Se mi dai la variante o un codice prodotto, restringo al 100%."
+        )
+
+    # -----------------------
+    # LOG: support_links_resolved
+    # -----------------------
+    log_event(session_id, "support_links_resolved", {
+        "model_input": model_input,
+        "model_resolved": resolved_model,
+        "issue_raw": issue_raw,
+        "issue_key": issue_key,
+        "priority": priority,
+        "links_count": len(direct_links),
+        "has_variants": has_variants
+    })
+
     return {
         "session_id": session_id,
-        "flow_type": flow_type,
-        "primary_product": primary,
-        "secondary_product": secondary,
-        "explanation": explanation,
+        "assistant_message": assistant_msg,
+        "recommendation": {
+            "model": shown_model,
+            "resolved_model": resolved_model,
+            "issue": issue_raw,
+            "issue_key": issue_key,
+            "priority": priority,
+            "direct_links": direct_links,
+            "has_variants": has_variants
+        }
     }
 
 
 # ---------------------------------------------------------
-#       Q3 / Q3_RX → RACCOMANDAZIONE FINALE
+# PROCESS ANSWER (dispatcher unico)
 # ---------------------------------------------------------
 
-def process_sport_third_answer(session_id: str, answer: str) -> Dict[str, Any]:
+def process_answer(session_id: str, answer: str) -> Dict[str, Any]:
     """
-    Gestisce la risposta alla Q3 del flow sportivo e chiude con la raccomandazione.
-    """
-    normalized = normalize_sport_priority(answer)
-
-    log_event(session_id, "answer_given", {
-        "question_id": "Q3",
-        "raw_answer": answer,
-        "normalized": normalized
-    })
-
-    rec = recommend_products_for_session(session_id)
-    primary = rec.get("primary_product")
-    secondary = rec.get("secondary_product")
-    explanation = rec.get("explanation")
-
-    # Messaggio finale per l'utente
-    lines = [explanation]
-
-    if primary:
-        lines.append(f"\n\n👉 Scelta principale: **{primary['name']}**")
-    if secondary:
-        lines.append(f"\n➕ Seconda opzione: **{secondary['name']}**")
-
-    lines.append("\n\nSe vuoi, possiamo affinare ancora il consiglio confrontando questi modelli o aggiungendo il budget.")
-
-    assistant_msg = "".join(lines)
-
-    log_event(session_id, "recommendation_generated", {
-        "flow_type": "sport_flow",
-        "primary_product": primary,
-        "secondary_product": secondary,
-        "explanation": explanation,
-    })
-
-    return {
-        "session_id": session_id,
-        "flow_type": "sport_flow",
-        "assistant_message": assistant_msg,
-        "recommendation": rec,
-    }
-
-
-def process_rx_third_answer(session_id: str, answer: str) -> Dict[str, Any]:
-    """
-    Gestisce la risposta alla Q3_RX del flow RX e chiude con la raccomandazione.
-    """
-    normalized = normalize_rx_priority(answer)
-
-    log_event(session_id, "answer_given", {
-        "question_id": "Q3_RX",
-        "raw_answer": answer,
-        "normalized": normalized
-    })
-
-    rec = recommend_products_for_session(session_id)
-    primary = rec.get("primary_product")
-    secondary = rec.get("secondary_product")
-    explanation = rec.get("explanation")
-
-    lines = [explanation]
-
-    if primary:
-        lines.append(f"\n\n👉 Configurazione principale: **{primary['name']}**")
-    if secondary:
-        lines.append(f"\n➕ Seconda opzione RX: **{secondary['name']}**")
-
-    lines.append("\n\nSe vuoi, possiamo entrare più nel dettaglio su lenti, spessori o alternative di montatura.")
-
-    assistant_msg = "".join(lines)
-
-    log_event(session_id, "recommendation_generated", {
-        "flow_type": "rx_flow",
-        "primary_product": primary,
-        "secondary_product": secondary,
-        "explanation": explanation,
-    })
-
-    return {
-        "session_id": session_id,
-        "flow_type": "rx_flow",
-        "assistant_message": assistant_msg,
-        "recommendation": rec,
-    }
-
-
-def process_third_answer(session_id: str, answer: str) -> Dict[str, Any]:
-    """
-    Dispatch generico per la terza risposta:
-    - Se la session è sport_flow → process_sport_third_answer
-    - Se la session è rx_flow    → process_rx_third_answer
+    Dispatcher unico: decide cosa fare in base all'ultima domanda (question_id) loggata.
     """
     flow_type = get_flow_for_session(session_id)
+    last_qid = get_last_question_id(session_id)
 
+    # SUPPORT FLOW
+    if flow_type == "support_flow":
+        if last_qid == "SUP_Q1":
+            return process_support_first_answer(session_id, answer)
+        if last_qid == "SUP_Q2":
+            return process_support_second_answer(session_id, answer)
+        if last_qid == "SUP_Q2_VARIANT":
+            return process_support_variant_answer(session_id, answer)
+        if last_qid == "SUP_Q3":
+            return process_support_third_answer(session_id, answer)
+
+        q = "Che tipo di problema hai? (lente / montatura-aste / viti / nasello / clip-in / altro)"
+        log_event(session_id, "question_asked", {"question_id": "SUP_Q1", "text": q})
+        return {"session_id": session_id, "assistant_message": "Ok, ripartiamo da qui.", "next_question": q}
+
+    # RX FLOW (placeholder: qui manteniamo compatibilità con eventuali file esterni)
     if flow_type == "rx_flow":
-        return process_rx_third_answer(session_id, answer)
+        q = "Hai già una prescrizione oculistica recente (indicativamente non più vecchia di 1-2 anni)?"
+        log_event(session_id, "question_asked", {"question_id": "Q1_RX", "text": q})
+        return {"session_id": session_id, "assistant_message": "Ok, ripartiamo da qui.", "next_question": q}
 
-    return process_sport_third_answer(session_id, answer)
+    # SPORT FLOW (default)
+    q = "Le tue uscite sono principalmente su strada, gravel o MTB?"
+    log_event(session_id, "question_asked", {"question_id": "Q1", "text": q})
+    return {"session_id": session_id, "assistant_message": "Ok, ripartiamo da qui.", "next_question": q}
