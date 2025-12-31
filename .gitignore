@@ -19,6 +19,15 @@ venv/
 # Env files
 .env
 
+# --- local runtime outputs ---
+analytics_out/
+backend/analytics/
 backend/logs/
-*.jsonl
-*_backup.py
+
+# --- backups ---
+*.bak
+*.bak_*
+*.bak_20*
+
+# --- patch scripts (one-off) ---
+patch_*.py
