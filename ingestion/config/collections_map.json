@@ -1,0 +1,65 @@
+{
+  "merchandising_exact": [
+    "newest-arrivals",
+    "bestseller",
+    "all",
+    "pacchetti-sconto",
+    "performance-eyewear-promo",
+    "outlet-occhiali",
+    "outlet-abbigliamento"
+  ],
+  "merchandising_prefixes": [
+    "outlet-"
+  ],
+
+  "support_prefixes": [
+    "parti-di-ricambio",
+    "ricambi-",
+    "lenti-di-ricambio",
+    "accessori-per-occhiali"
+  ],
+  "support_contains": [
+    "parti-di-ricambio",
+    "ricambi",
+    "lenti-di-ricambio",
+    "accessori-occhiale",
+    "accessori-per-occhiali"
+  ],
+
+  "edition_exact": [
+    "scicon-x-tour-de-france-collection",
+    "occhiali-in-edizione-limitata",
+    "fluo-collection",
+    "flag-edition-bags",
+    "aerocomfort-3-0-flag-edition-bike-bags",
+    "space-agency-capsule-collection",
+    "aeroshade-kunken-monogram"
+  ],
+  "edition_contains": [
+    "tour-de-france",
+    "flag-edition",
+    "capsule",
+    "edizione-limitata",
+    "limited",
+    "fluo",
+    "monogram"
+  ],
+
+  "model_family_exact": [
+    "protox-2-0",
+    "phantom",
+    "protom",
+    "vertex",
+    "gallio",
+    "gravel",
+    "protom-2-0",
+    "roygo",
+    "vertec",
+    "turcio-2-0",
+    "aerowatt-foza"
+  ],
+  "model_family_suffixes": [
+    "-sunglasses",
+    "-eyewear"
+  ]
+}

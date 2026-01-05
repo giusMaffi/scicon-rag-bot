@@ -31,3 +31,13 @@ backend/logs/
 
 # --- patch scripts (one-off) ---
 patch_*.py
+
+# --- ingestion pipeline (local only) ---
+ingestion/data/
+ingestion/out/
+
+# --- advisor runtime data ---
+backend/advisor/data/
+
+# --- python backups ---
+*_backup.py
